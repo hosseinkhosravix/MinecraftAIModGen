@@ -73,22 +73,23 @@ jobs:
         cat input_modspec.json
 
     # ──────────────────────────────────────
-    # 5. Enrich modspec with OpenRouter
+    # 5. Enrich modspec with Gemini
     # ──────────────────────────────────────
-    - name: Enrich modspec via OpenRouter
+    - name: Enrich modspec via Gemini
       env:
-        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
         python scripts/modspec_enhancer.py input_modspec.json enriched_modspec.json
         echo "=== Enriched modspec ==="
         cat enriched_modspec.json
 
     # ──────────────────────────────────────
-    # 6. Generate Java source code (with self‑heal)
+    # 6. Generate Java source code (HF Forge Coder + Gemini self‑heal)
     # ──────────────────────────────────────
-    - name: Generate Java code with AI (OpenRouter)
+    - name: Generate Java code with AI
       env:
-        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
         mkdir -p src/main/java
         python scripts/code_generator.py enriched_modspec.json src/main/java
@@ -123,7 +124,7 @@ jobs:
     # ──────────────────────────────────────
     - name: Build mod JAR
       env:
-        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
         python scripts/builder.py enriched_modspec.json
         echo "Build artifacts:"
