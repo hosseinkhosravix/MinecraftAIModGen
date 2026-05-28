@@ -1,70 +1,130 @@
 import json, sys, os, subprocess, time, requests
 from pathlib import Path
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+HF_URL = "https://api-inference.huggingface.co/models/hwding/forge-coder-v1.21.11"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 MAX_FIX_ATTEMPTS = 3
 
-def call_openrouter(messages, api_key, model="google/gemini-2.0-flash-exp:free"):
+def call_hf(prompt, hf_token, retries=3):
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json",
         "User-Agent": "ModPipeline/1.0"
     }
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 2048, "temperature": 0.7}}
+    for i in range(retries):
+        try:
+            resp = requests.post(HF_URL, headers=headers, json=payload, timeout=180)
+            if resp.status_code == 429:
+                wait = 10 * (i+1)
+                print(f"HF rate limit, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            result = resp.json()
+            if isinstance(result, list) and 'generated_text' in result[0]:
+                return result[0]['generated_text']
+            else:
+                return result[0]['generated_text'] if isinstance(result, list) else str(result)
+        except Exception as e:
+            print(f"HF attempt {i+1} failed: {e}")
+            if i == retries - 1:
+                raise
+            time.sleep(10)
+
+def call_gemini(prompt, api_key):
+    headers = {"Content-Type": "application/json", "User-Agent": "ModPipeline/1.0"}
     payload = {
-        "model": model,
-        "messages": messages,
-        "response_format": {"type": "json_object"}
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"}
     }
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
+    resp = requests.post(f"{GEMINI_URL}?key={api_key}", headers=headers, json=payload, timeout=120)
     resp.raise_for_status()
-    return json.loads(resp.json()["choices"][0]["message"]["content"])
+    data = resp.json()
+    text = data['candidates'][0]['content']['parts'][0]['text']
+    return json.loads(text)
 
 def write_files(file_dict, base="src/main/java"):
     for path, content in file_dict.items():
-        full = Path(base) / path
-        full.parent.mkdir(parents=True, exist_ok=True)
-        with open(full, "w") as f: f.write(content)
+        full_path = Path(base) / path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(full_path, 'w') as f:
+            f.write(content)
 
 def compile_project():
-    res = subprocess.run(["./gradlew", "build"], capture_output=True, text=True)
+    res = subprocess.run(["./gradlew", "build"], capture_output=True, text=True, cwd=".")
     return res.returncode == 0, res.stderr + "\n" + res.stdout
 
 def generate_code(modspec_path, output_dir):
-    with open(modspec_path) as f: modspec = json.load(f)
+    with open(modspec_path, 'r') as f:
+        modspec = json.load(f)
 
+    # Prompt for Hugging Face Forge Coder
     prompt = f"""
-Generate a complete Minecraft Forge mod (version {modspec['mc_version']}) from this modspec.
-Return ONLY a JSON object mapping relative file paths to file contents. Include build.gradle and all Java classes in package com.{modspec['modid']}.
-Use proper Forge registries, annotations, and events.
+Generate a complete Minecraft Forge mod for version {modspec['mc_version']} based on the following modspec.
+The mod must include:
+- A main mod class with @Mod annotation
+- Registration for all items, blocks (if any), and entities (mobs)
+- Proper event handlers
+- All classes in the package com.{modspec['modid']}
+- Use correct Forge registries and deferred registers
+- Include a build.gradle file with the correct Forge MDK settings.
+
+Return ONLY a JSON object where keys are file paths relative to src/main/java/ (or build.gradle) and values are the complete file contents.
+For example:
+{{
+  "build.gradle": "...",
+  "com/example/modid/ModMain.java": "...",
+  ...
+}}
 
 Modspec:
 {json.dumps(modspec, indent=2)}
 """
-    messages = [{"role":"user","content": prompt}]
-    api_key = os.environ["OPENROUTER_API_KEY"]
-    files = call_openrouter(messages, api_key)
+    hf_token = os.environ['HF_TOKEN']
+    raw_output = call_hf(prompt, hf_token)
 
-    write_files(files, output_dir)
-
-    # Self-healing loop
-    for attempt in range(1, MAX_FIX_ATTEMPTS+1):
-        success, error = compile_project()
-        if success:
-            print("Compilation OK")
-            return
-        print(f"Compilation error (attempt {attempt}):\n{error}")
-        if attempt == MAX_FIX_ATTEMPTS: raise RuntimeError("Can't fix errors")
-        fix_prompt = f"""
-Fix these build errors. Return corrected files as JSON (same structure).
-Modspec: {json.dumps(modspec)}
-Current files: {json.dumps(files)}
-Build errors: {error}
+    # Try to parse as JSON; if fails, use Gemini to reformat
+    try:
+        files_dict = json.loads(raw_output)
+    except (json.JSONDecodeError, TypeError):
+        print("Forge Coder output not JSON, using Gemini to extract...")
+        reformat_prompt = f"""
+Convert the following raw AI output into a valid JSON object with file paths as keys and content as values. Output ONLY the JSON.
+Raw output:
+{raw_output}
 """
-        messages = [{"role":"user","content": fix_prompt}]
-        fixed = call_openrouter(messages, api_key)
-        files.update(fixed)
-        write_files(fixed, output_dir)
+        files_dict = call_gemini(reformat_prompt, os.environ['GEMINI_API_KEY'])
+
+    write_files(files_dict, output_dir)
+
+    # Self-healing loop using Gemini
+    for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+        success, error_msg = compile_project()
+        if success:
+            print("Compilation successful!")
+            return
+        print(f"Compilation error (attempt {attempt}):\n{error_msg}")
+        if attempt == MAX_FIX_ATTEMPTS:
+            raise RuntimeError("Failed to fix compilation errors after max attempts.")
+        fix_prompt = f"""
+The following Java project failed to build. The modspec and current file contents are provided below.
+Please fix the compilation errors and return the corrected files as a JSON object (same format as before: keys=paths, values=content).
+Only output the JSON.
+
+Modspec:
+{json.dumps(modspec, indent=2)}
+Current files:
+{json.dumps(files_dict, indent=2)}
+Build errors:
+{error_msg}
+"""
+        fixed_files = call_gemini(fix_prompt, os.environ['GEMINI_API_KEY'])
+        files_dict.update(fixed_files)
+        write_files(fixed_files, output_dir)
 
 if __name__ == "__main__":
-    if len(sys.argv)!=3: sys.exit(1)
+    if len(sys.argv) != 3:
+        print("Usage: python code_generator.py <modspec_json> <output_source_dir>")
+        sys.exit(1)
     generate_code(sys.argv[1], sys.argv[2])
