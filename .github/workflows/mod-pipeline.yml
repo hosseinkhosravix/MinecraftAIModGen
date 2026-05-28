@@ -10,8 +10,6 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  FORGE_VERSION: '1.20.1-48.1.0'          # adjust if needed
-  GRADLE_VERSION: '8.5'
 
 jobs:
   build-mod:
@@ -35,8 +33,7 @@ jobs:
         cache: 'pip'
 
     - name: Install Python dependencies
-      run: |
-        pip install -r scripts/requirements.txt
+      run: pip install -r scripts/requirements.txt
 
     # ──────────────────────────────────────
     # 3. Setup Java & Gradle
@@ -58,23 +55,18 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-gradle-
 
-    - name: Ensure Gradle wrapper and Forge MDK
+    - name: Verify Gradle wrapper
       run: |
         if [ ! -f gradlew ]; then
-          echo "No Gradle wrapper found. Downloading Forge MDK for ${{ env.FORGE_VERSION }}..."
-          wget -q "https://maven.minecraftforge.net/net/minecraftforge/forge/${{ env.FORGE_VERSION }}/forge-${{ env.FORGE_VERSION }}-mdk.zip"
-          unzip -q "forge-${{ env.FORGE_VERSION }}-mdk.zip"
-          rm "forge-${{ env.FORGE_VERSION }}-mdk.zip"
-          chmod +x gradlew
+          echo "::error::Gradle wrapper not found. Please add the Forge MDK files to the repository."
+          exit 1
         fi
-        if [ ! -f settings.gradle ]; then
-          echo "rootProject.name = 'modgen'" > settings.gradle
-        fi
+        chmod +x gradlew
 
     # ──────────────────────────────────────
-    # 4. Load and save the modspec
+    # 4. Save the modspec from GUI input
     # ──────────────────────────────────────
-    - name: Save input modspec to file
+    - name: Save input modspec
       run: |
         echo '${{ github.event.inputs.modspec_json }}' > input_modspec.json
         echo "=== Received modspec ==="
@@ -148,7 +140,7 @@ jobs:
         if-no-files-found: error
 
     # ──────────────────────────────────────
-    # 11. Commit generated files back to repo (optional)
+    # 11. Commit generated files (optional)
     # ──────────────────────────────────────
     - name: Commit generated files
       if: success()
