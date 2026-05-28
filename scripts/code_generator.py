@@ -2,7 +2,7 @@ import json, sys, os, subprocess, time, requests
 from pathlib import Path
 
 HF_URL = "https://api-inference.huggingface.co/models/hwding/forge-coder-v1.21.11"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
 MAX_FIX_ATTEMPTS = 3
 
 def call_hf(prompt, hf_token, retries=3):
@@ -32,17 +32,32 @@ def call_hf(prompt, hf_token, retries=3):
                 raise
             time.sleep(10)
 
-def call_gemini(prompt, api_key):
+def call_gemini(prompt, api_key, retries=3, model="gemini-1.5-flash"):
     headers = {"Content-Type": "application/json", "User-Agent": "ModPipeline/1.0"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json"}
     }
-    resp = requests.post(f"{GEMINI_URL}?key={api_key}", headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    text = data['candidates'][0]['content']['parts'][0]['text']
-    return json.loads(text)
+    url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent"
+    for i in range(retries):
+        try:
+            resp = requests.post(f"{url}?key={api_key}", headers=headers, json=payload, timeout=120)
+            if resp.status_code == 429:
+                wait = 2 ** i + 5
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            text = data['candidates'][0]['content']['parts'][0]['text']
+            return json.loads(text)
+        except Exception as e:
+            print(f"Gemini attempt {i+1} failed: {e}")
+            if i == retries - 1:
+                if model == "gemini-1.5-flash":
+                    print("Trying model 'gemini-1.5-flash-latest'...")
+                    return call_gemini(prompt, api_key, retries=1, model="gemini-1.5-flash-latest")
+                raise
+            time.sleep(5)
 
 def write_files(file_dict, base="src/main/java"):
     for path, content in file_dict.items():
@@ -59,7 +74,6 @@ def generate_code(modspec_path, output_dir):
     with open(modspec_path, 'r') as f:
         modspec = json.load(f)
 
-    # Prompt for Hugging Face Forge Coder
     prompt = f"""
 Generate a complete Minecraft Forge mod for version {modspec['mc_version']} based on the following modspec.
 The mod must include:
@@ -84,7 +98,6 @@ Modspec:
     hf_token = os.environ['HF_TOKEN']
     raw_output = call_hf(prompt, hf_token)
 
-    # Try to parse as JSON; if fails, use Gemini to reformat
     try:
         files_dict = json.loads(raw_output)
     except (json.JSONDecodeError, TypeError):
@@ -98,7 +111,6 @@ Raw output:
 
     write_files(files_dict, output_dir)
 
-    # Self-healing loop using Gemini
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         success, error_msg = compile_project()
         if success:
