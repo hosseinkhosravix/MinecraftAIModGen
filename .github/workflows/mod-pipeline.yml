@@ -1,21 +1,22 @@
 name: AI Minecraft Mod Pipeline (Free APIs)
 
 on:
-  repository_dispatch:
-    types: [build-mod]
+  workflow_dispatch:
+    inputs:
+      modspec_json:
+        description: 'The mod specification (JSON)'
+        required: true
+        type: string
 
 env:
   PYTHON_VERSION: '3.11'
-  GRADLE_VERSION: '8.5'
   FORGE_VERSION: '1.20.1-48.1.0'          # adjust if needed
-  MOD_GROUP: 'com.example'                # placeholder, will be overwritten
+  GRADLE_VERSION: '8.5'
 
 jobs:
   build-mod:
     runs-on: ubuntu-latest
-    timeout-minutes: 40                    # generous timeout for AI calls + compilation
-    strategy:
-      fail-fast: false                     # continue even if a step fails? We'll handle errors ourselves
+    timeout-minutes: 40
 
     steps:
     # ──────────────────────────────────────
@@ -23,11 +24,9 @@ jobs:
     # ──────────────────────────────────────
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 1
 
     # ──────────────────────────────────────
-    # 2. Setup Python and install dependencies (with cache)
+    # 2. Setup Python
     # ──────────────────────────────────────
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -35,13 +34,12 @@ jobs:
         python-version: ${{ env.PYTHON_VERSION }}
         cache: 'pip'
 
-    - name: Install Python requirements
+    - name: Install Python dependencies
       run: |
         pip install -r scripts/requirements.txt
-        pip install requests Pillow jsonschema 2>/dev/null || true
 
     # ──────────────────────────────────────
-    # 3. Setup Java & Gradle (Forge MDK provision)
+    # 3. Setup Java & Gradle
     # ──────────────────────────────────────
     - name: Setup Java 17
       uses: actions/setup-java@v4
@@ -64,28 +62,26 @@ jobs:
       run: |
         if [ ! -f gradlew ]; then
           echo "No Gradle wrapper found. Downloading Forge MDK for ${{ env.FORGE_VERSION }}..."
-          # Use a minimal Forge MDK downloader (official)
-          wget -q https://maven.minecraftforge.net/net/minecraftforge/forge/${{ env.FORGE_VERSION }}/forge-${{ env.FORGE_VERSION }}-mdk.zip
-          unzip -q forge-${{ env.FORGE_VERSION }}-mdk.zip
-          rm forge-${{ env.FORGE_VERSION }}-mdk.zip
+          wget -q "https://maven.minecraftforge.net/net/minecraftforge/forge/${{ env.FORGE_VERSION }}/forge-${{ env.FORGE_VERSION }}-mdk.zip"
+          unzip -q "forge-${{ env.FORGE_VERSION }}-mdk.zip"
+          rm "forge-${{ env.FORGE_VERSION }}-mdk.zip"
           chmod +x gradlew
         fi
-        # Create a basic settings.gradle if missing
         if [ ! -f settings.gradle ]; then
           echo "rootProject.name = 'modgen'" > settings.gradle
         fi
 
     # ──────────────────────────────────────
-    # 4. Load and prepare input modspec
+    # 4. Load and save the modspec
     # ──────────────────────────────────────
-    - name: Load user modspec from dispatch
+    - name: Save input modspec to file
       run: |
-        echo '${{ github.event.client_payload.modspec_json }}' > input_modspec.json
+        echo '${{ github.event.inputs.modspec_json }}' > input_modspec.json
         echo "=== Received modspec ==="
         cat input_modspec.json
 
     # ──────────────────────────────────────
-    # 5. Enhance modspec with OpenRouter
+    # 5. Enrich modspec with OpenRouter
     # ──────────────────────────────────────
     - name: Enrich modspec via OpenRouter
       env:
@@ -120,8 +116,8 @@ jobs:
         find assets -name "*.png" | head -20
 
     # ──────────────────────────────────────
-    # 8. (Optional) Generate 3D structures with fal.ai
-    #     Disabled by default; enable by removing 'if: false'
+    # 8. (Optional) Generate structures with fal.ai
+    #     Enable by removing 'if: false'
     # ──────────────────────────────────────
     - name: Generate structures (fal.ai)
       if: false
@@ -131,31 +127,30 @@ jobs:
         python scripts/structure_generator.py enriched_modspec.json assets
 
     # ──────────────────────────────────────
-    # 9. Build final JAR with Gradle
+    # 9. Build final JAR
     # ──────────────────────────────────────
     - name: Build mod JAR
       env:
-        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}  # for potential fix-ups
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       run: |
         python scripts/builder.py enriched_modspec.json
         echo "Build artifacts:"
         ls -lh build/libs/
 
     # ──────────────────────────────────────
-    # 10. Upload JAR as GitHub artifact
+    # 10. Upload JAR as artifact
     # ──────────────────────────────────────
     - name: Upload mod artifact
       uses: actions/upload-artifact@v4
       with:
-        # Use mod name and version from the enriched spec (fallback to generic)
-        name: mod-jar-${{ github.run_id }}
+        name: mod-jar
         path: build/libs/*.jar
         if-no-files-found: error
 
     # ──────────────────────────────────────
-    # 11. Commit generated source and assets (optional)
+    # 11. Commit generated files back to repo (optional)
     # ──────────────────────────────────────
-    - name: Commit generated files to repo
+    - name: Commit generated files
       if: success()
       run: |
         git config user.name "github-actions"
@@ -163,22 +158,3 @@ jobs:
         git add src/ assets/ enriched_modspec.json build.gradle
         git diff --cached --quiet || git commit -m "🤖 Auto-generated mod from GUI [skip ci]"
         git push
-
-  # ──────────────────────────────────────
-  # 12. (Future) Automated headless test job
-  #     Uncomment and fill in details when ready
-  # ──────────────────────────────────────
-  # test-mod:
-  #   needs: build-mod
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 10
-  #   steps:
-  #     - name: Checkout repo
-  #       uses: actions/checkout@v4
-  #     - name: Download artifact
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: mod-jar-${{ github.run_id }}
-  #     - name: Run headless Minecraft server
-  #       uses: ... (custom Docker action)
-  #       ...
