@@ -1,0 +1,184 @@
+name: AI Minecraft Mod Pipeline (Free APIs)
+
+on:
+  repository_dispatch:
+    types: [build-mod]
+
+env:
+  PYTHON_VERSION: '3.11'
+  GRADLE_VERSION: '8.5'
+  FORGE_VERSION: '1.20.1-48.1.0'          # adjust if needed
+  MOD_GROUP: 'com.example'                # placeholder, will be overwritten
+
+jobs:
+  build-mod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40                    # generous timeout for AI calls + compilation
+    strategy:
+      fail-fast: false                     # continue even if a step fails? We'll handle errors ourselves
+
+    steps:
+    # ──────────────────────────────────────
+    # 1. Checkout repository
+    # ──────────────────────────────────────
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    # ──────────────────────────────────────
+    # 2. Setup Python and install dependencies (with cache)
+    # ──────────────────────────────────────
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Python requirements
+      run: |
+        pip install -r scripts/requirements.txt
+        pip install requests Pillow jsonschema 2>/dev/null || true
+
+    # ──────────────────────────────────────
+    # 3. Setup Java & Gradle (Forge MDK provision)
+    # ──────────────────────────────────────
+    - name: Setup Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Cache Gradle packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+          .gradle
+        key: ${{ runner.os }}-gradle-${{ hashFiles('build.gradle', 'settings.gradle') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+
+    - name: Ensure Gradle wrapper and Forge MDK
+      run: |
+        if [ ! -f gradlew ]; then
+          echo "No Gradle wrapper found. Downloading Forge MDK for ${{ env.FORGE_VERSION }}..."
+          # Use a minimal Forge MDK downloader (official)
+          wget -q https://maven.minecraftforge.net/net/minecraftforge/forge/${{ env.FORGE_VERSION }}/forge-${{ env.FORGE_VERSION }}-mdk.zip
+          unzip -q forge-${{ env.FORGE_VERSION }}-mdk.zip
+          rm forge-${{ env.FORGE_VERSION }}-mdk.zip
+          chmod +x gradlew
+        fi
+        # Create a basic settings.gradle if missing
+        if [ ! -f settings.gradle ]; then
+          echo "rootProject.name = 'modgen'" > settings.gradle
+        fi
+
+    # ──────────────────────────────────────
+    # 4. Load and prepare input modspec
+    # ──────────────────────────────────────
+    - name: Load user modspec from dispatch
+      run: |
+        echo '${{ github.event.client_payload.modspec_json }}' > input_modspec.json
+        echo "=== Received modspec ==="
+        cat input_modspec.json
+
+    # ──────────────────────────────────────
+    # 5. Enhance modspec with OpenRouter
+    # ──────────────────────────────────────
+    - name: Enrich modspec via OpenRouter
+      env:
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      run: |
+        python scripts/modspec_enhancer.py input_modspec.json enriched_modspec.json
+        echo "=== Enriched modspec ==="
+        cat enriched_modspec.json
+
+    # ──────────────────────────────────────
+    # 6. Generate Java source code (with self‑heal)
+    # ──────────────────────────────────────
+    - name: Generate Java code with AI (OpenRouter)
+      env:
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      run: |
+        mkdir -p src/main/java
+        python scripts/code_generator.py enriched_modspec.json src/main/java
+        echo "Generated source files:"
+        find src/main/java -name "*.java" | head -20
+
+    # ──────────────────────────────────────
+    # 7. Generate textures using ModelsLab
+    # ──────────────────────────────────────
+    - name: Generate pixel art textures (ModelsLab)
+      env:
+        MODELSLAB_API_KEY: ${{ secrets.MODELSLAB_API_KEY }}
+      run: |
+        mkdir -p assets
+        python scripts/texture_generator.py enriched_modspec.json assets
+        echo "Generated textures:"
+        find assets -name "*.png" | head -20
+
+    # ──────────────────────────────────────
+    # 8. (Optional) Generate 3D structures with fal.ai
+    #     Disabled by default; enable by removing 'if: false'
+    # ──────────────────────────────────────
+    - name: Generate structures (fal.ai)
+      if: false
+      env:
+        FALAI_API_KEY: ${{ secrets.FALAI_API_KEY }}
+      run: |
+        python scripts/structure_generator.py enriched_modspec.json assets
+
+    # ──────────────────────────────────────
+    # 9. Build final JAR with Gradle
+    # ──────────────────────────────────────
+    - name: Build mod JAR
+      env:
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}  # for potential fix-ups
+      run: |
+        python scripts/builder.py enriched_modspec.json
+        echo "Build artifacts:"
+        ls -lh build/libs/
+
+    # ──────────────────────────────────────
+    # 10. Upload JAR as GitHub artifact
+    # ──────────────────────────────────────
+    - name: Upload mod artifact
+      uses: actions/upload-artifact@v4
+      with:
+        # Use mod name and version from the enriched spec (fallback to generic)
+        name: mod-jar-${{ github.run_id }}
+        path: build/libs/*.jar
+        if-no-files-found: error
+
+    # ──────────────────────────────────────
+    # 11. Commit generated source and assets (optional)
+    # ──────────────────────────────────────
+    - name: Commit generated files to repo
+      if: success()
+      run: |
+        git config user.name "github-actions"
+        git config user.email "actions@github.com"
+        git add src/ assets/ enriched_modspec.json build.gradle
+        git diff --cached --quiet || git commit -m "🤖 Auto-generated mod from GUI [skip ci]"
+        git push
+
+  # ──────────────────────────────────────
+  # 12. (Future) Automated headless test job
+  #     Uncomment and fill in details when ready
+  # ──────────────────────────────────────
+  # test-mod:
+  #   needs: build-mod
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 10
+  #   steps:
+  #     - name: Checkout repo
+  #       uses: actions/checkout@v4
+  #     - name: Download artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: mod-jar-${{ github.run_id }}
+  #     - name: Run headless Minecraft server
+  #       uses: ... (custom Docker action)
+  #       ...
