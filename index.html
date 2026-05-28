@@ -412,9 +412,24 @@
       throw new Error(`GitHub API error ${response.status}: ${errText}`);
     }
 
-    // The dispatch endpoint returns 200 with a JSON containing workflow_run_id
-    const data = await response.json();
-    return data.workflow_run_id;
+    // The dispatch returns 204 No Content – no JSON, so we don't parse it.
+    return true;
+  }
+
+  // Get the most recent run of the workflow (should be the one we just triggered)
+  async function getLatestRun(token) {
+    const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/workflows/${WORKFLOW_ID}/runs?per_page=1`;
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'ModPipeline/1.0'
+      }
+    });
+    if (!res.ok) throw new Error('Failed to fetch latest run.');
+    const data = await res.json();
+    if (data.workflow_runs.length === 0) return null;
+    return data.workflow_runs[0];
   }
 
   async function getRunStatus(runId, token) {
@@ -465,13 +480,29 @@
         if (!token) throw new Error('GitHub token is required.');
       }
 
-      // Step 3: Trigger workflow and get run ID
+      // Step 3: Trigger workflow (no JSON response)
       statusBox.innerHTML = '⏳ Triggering AI mod generation...';
-      const runId = await triggerWorkflow(spec, token);
+      await triggerWorkflow(spec, token);
+
+      // Step 4: Wait a moment for the run to appear, then get its ID
+      statusBox.innerHTML = '⏳ Waiting for the workflow run to start...';
+      await new Promise(r => setTimeout(r, 3000)); // small delay
+
+      let run = await getLatestRun(token);
+      // If the latest run is not new, wait a bit more (in case of delay)
+      let retries = 0;
+      while ((!run || run.status === 'completed') && retries < 5) {
+        await new Promise(r => setTimeout(r, 3000));
+        run = await getLatestRun(token);
+        retries++;
+      }
+
+      if (!run) throw new Error('Could not find the triggered workflow run.');
+
+      const runId = run.id;
       statusBox.innerHTML = `✅ Workflow started! Run ID: ${runId}. Waiting for completion...`;
 
-      // Step 4: Poll run status
-      let run = await getRunStatus(runId, token);
+      // Step 5: Poll run status
       while (run.status !== 'completed') {
         await new Promise(r => setTimeout(r, 15000));
         run = await getRunStatus(runId, token);
@@ -482,12 +513,11 @@
         throw new Error(`Workflow failed with conclusion: ${run.conclusion}. Check the Actions tab for details.`);
       }
 
-      // Step 5: Get artifact download URL
+      // Step 6: Get artifact download URL
       const artifacts = await getArtifacts(runId, token);
       if (artifacts.length === 0) throw new Error('No artifacts found. The mod may have failed to build.');
 
       const modArtifact = artifacts.find(a => a.name === 'mod-jar') || artifacts[0];
-      // The artifact download URL is: /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip
       const downloadUrl = `https://github.com/${REPO_OWNER}/${REPO_NAME}/actions/runs/${runId}/artifacts/${modArtifact.id}`;
 
       downloadArea.innerHTML = `
