@@ -1,6 +1,7 @@
 import json, sys, os, hashlib, time, requests
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+# Corrected endpoint – v1 (stable)
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -17,7 +18,7 @@ def set_cache(prompt, data):
     with open(os.path.join(CACHE_DIR, h + ".json"), 'w') as f:
         json.dump(data, f)
 
-def call_gemini(prompt, api_key, retries=3):
+def call_gemini(prompt, api_key, retries=3, model="gemini-1.5-flash"):
     cached = get_cache(prompt)
     if cached:
         print("Using cached Gemini response.")
@@ -33,10 +34,11 @@ def call_gemini(prompt, api_key, retries=3):
             "responseMimeType": "application/json"
         }
     }
+    url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent"
     for i in range(retries):
         try:
             resp = requests.post(
-                f"{GEMINI_URL}?key={api_key}",
+                f"{url}?key={api_key}",
                 headers=headers,
                 json=payload,
                 timeout=120
@@ -55,6 +57,10 @@ def call_gemini(prompt, api_key, retries=3):
         except Exception as e:
             print(f"Gemini attempt {i+1} failed: {e}")
             if i == retries - 1:
+                # Try alternative model name before giving up
+                if model == "gemini-1.5-flash":
+                    print("Trying model 'gemini-1.5-flash-latest'...")
+                    return call_gemini(prompt, api_key, retries=1, model="gemini-1.5-flash-latest")
                 raise
             time.sleep(5)
 
